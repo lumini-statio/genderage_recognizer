@@ -7,9 +7,10 @@ import os
 import matplotlib.pyplot as plt
 
 class GenderAnalysis:
-    def __init__(self, app: FaceAnalysis, gamma: float = 1.0):
+    def __init__(self, app: FaceAnalysis, gamma: float = 1.0, use_bilateral: bool = False):
         self.app = app
         self.gamma = gamma
+        self.use_bilateral = use_bilateral
         # Pre-calculamos la tabla LUT para la corrección gamma
         self.lut = self._build_lut(gamma)
         self.gender_guesser = Detector()
@@ -18,14 +19,23 @@ class GenderAnalysis:
         """Crea una tabla de búsqueda para aplicar gamma rápidamente."""
         inv_gamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** inv_gamma) * 255 
-                          for i in np.arange(0, 256)]).astype("uint8")
+                            for i in np.arange(0, 256)]).astype("uint8")
         return table
 
-    def apply_gamma(self, img: np.ndarray) -> np.ndarray:
-        """Aplica la corrección gamma a la imagen usando la LUT."""
-        if self.gamma == 1.0:
-            return img
-        return cv2.LUT(img, self.lut)
+    def _apply_preprocessing(self, img: np.ndarray) -> np.ndarray:
+        """Centraliza las técnicas de mejora de imagen."""
+        # 1. Corrección Gamma
+        if self.gamma != 1.0:
+            img = cv2.LUT(img, self.lut)
+        
+        # 2. Filtro Bilateral (Opcional)
+        if self.use_bilateral:
+            # d=9: Diámetro del vecindario
+            # sigmaColor=75: Filtro en el espacio de color (mezcla colores cercanos)
+            # sigmaSpace=75: Filtro en el espacio coordinado (distancia entre píxeles)
+            img = cv2.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+            
+        return img
 
     def get_embedding(self, img_path: str) -> np.ndarray | None:
         """Detecta embeddings solo si hay EXACTAMENTE una cara en la imagen.
@@ -37,7 +47,7 @@ class GenderAnalysis:
             return None
         
         # Aplicamos corrección gamma antes de la detección
-        img_processed = self.apply_gamma(img)
+        img_processed = self._apply_preprocessing(img)
         
         faces = self.app.get(img_processed)
         if faces and len(faces) == 1:
@@ -162,20 +172,29 @@ class GenderAnalysis:
         return (len(exitos), len(erroneos), pct_exitos, pct_erroneos)
     
 
-    def evaluate_lfw_gender_accuracy(self):
+    def evaluate_lfw_gender_accuracy(self, pickle_file: str):
         import requests, time
         exitos = []
-        erroneos = []
+        erroneos = {
+            'personas': [],
+            'cant_mujeres': 0,
+            'cant_hombres': 0
+        }
         
-        data = self.get_all_embeddings('lfw_genres_insightface.pkl')
+        data = self.get_all_embeddings(pickle_file)
         
         for record in data['records']:
             try:
+                if record['age'] < 15:
+                    continue
+                
                 filename: str = record['filename'].split('/')[-1]
                 person_name: str = filename.split('_')[0]
                 guessed_gender = self.gender_guesser.get_gender(person_name)                
                 # Convertir a español para comparar
-                if guessed_gender == 'male':
+                if guessed_gender in ('andy', 'unknown', 'mostly_male', 'mostly_female'):
+                    continue
+                elif guessed_gender == 'male':
                     expected_gender = 'hombre'
                 elif guessed_gender == 'female':
                     expected_gender = 'mujer'
@@ -183,19 +202,38 @@ class GenderAnalysis:
                 if record['gender'] == expected_gender: 
                     exitos.append(record)
                 else:
-                    erroneos.append(record)
+                    erroneos['personas'].append(record)
+                    if expected_gender == 'mujer':
+                        erroneos['cant_mujeres'] += 1
+                    elif expected_gender == 'hombre':
+                        erroneos['cant_hombres'] += 1
             except Exception as e:
                 print(f"Error consultando {person_name}: {e}")
 
-        total = len(exitos) + len(erroneos)
+        total = len(exitos) + len(erroneos['personas'])
         pct_exitos = (len(exitos) / total) * 100 if total > 0 else 0
-        pct_erroneos = (len(erroneos) / total) * 100 if total > 0 else 0
+        pct_erroneos = (len(erroneos['personas']) / total) * 100 if total > 0 else 0
 
+        self.process_errors(erroneos['personas'])
+
+        err_mujeres: int = erroneos['cant_mujeres']
+        err_hombres: int = erroneos['cant_hombres']
+        
+        total_erroneos = err_mujeres + err_hombres
+        if total_erroneos > 0:
+            pcte_dif = abs(err_mujeres - err_hombres) / total_erroneos * 100
+        else:
+            pcte_dif = 0
+        
+        return (len(exitos), len(erroneos['personas']), pct_exitos, pct_erroneos, err_mujeres, err_hombres, pcte_dif)
+
+
+    def process_errors(self, erroneos: list, dir_out: str = 'out'):
         # Crear carpeta de salida
-        if not os.path.exists('out'):
-            os.makedirs('out')
+        if not os.path.exists(dir_out):
+            os.makedirs(dir_out)
 
-        for record in erroneos[:10]:
+        for record in erroneos[:30]:
             try:
                 img = cv2.imread(record['filename'])
                 if img is None:
@@ -214,18 +252,20 @@ class GenderAnalysis:
                 cv2.putText(img, label, (bbox[0], bbox[3] + 25), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                 
-                out_filename = record['filename'].split('/')[-1]
-                out_path = os.path.join('out', f'err_{out_filename}')
+                original_name = os.path.basename(record['filename'])
+                name_no_ext, ext = os.path.splitext(original_name)
+                out_filename_list = name_no_ext.replace('_', ' ').split()[:2]
+                out_filename = ' '.join(out_filename_list)
+                if not ext:
+                    ext = '.jpg'
+                out_path = os.path.join(dir_out, f'{out_filename}{ext}')
                 cv2.imwrite(out_path, img)
                 print(f"Guardada: {out_path}")
             except Exception as e:
                 print(f"Error procesando {record['filename']}: {e}")
 
-        return (len(exitos), len(erroneos), pct_exitos, pct_erroneos)
-
-
     def plot_gender_accuracy(self, results):
-        exitos_len, erroneos_len, pct_exitos, pct_erroneos = results
+        _, _, pct_exitos, pct_erroneos, _, _, _ = results
         
         labels = ['Éxitos', 'Errores']
         values = [pct_exitos, pct_erroneos]
@@ -242,6 +282,30 @@ class GenderAnalysis:
         for bar in bars:
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2, yval + 1, f'{yval:.2f}%', 
+                    ha='center', va='bottom', fontweight='bold')
+        
+        plt.tight_layout()
+        plt.show()
+        
+
+    def plot_gender_diff(self, results):
+        _, _, _, _, err_mujeres, err_hombres, _ = results
+        
+        labels = ['Mujeres', 'Hombres']
+        values = [err_mujeres, err_hombres]
+        colors = ['violet', 'blue']
+        
+        plt.figure(figsize=(8, 6))
+        bars = plt.bar(labels, values, color=colors)
+        
+        # Configuración de ejes y etiquetas
+        plt.ylabel('Cantidad')
+        plt.title('Diferencia de cantidad de errores en análisis')
+        plt.ylim(0, err_mujeres + err_hombres)
+        
+        for bar in bars:
+            yval = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2, yval + 1, f'{yval}', 
                     ha='center', va='bottom', fontweight='bold')
         
         plt.tight_layout()
